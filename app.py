@@ -61,16 +61,52 @@ def vt_guess(text):
     return candidates[0] if len(candidates)==1 else ''
 
 def reader_guess(text):
-    m=re.search(r'\bIMEI\s*[:#-]?\s*(\d[\d\s-]{12,20}\d)',text,re.I)
-    if m:
-        v=re.sub(r'\D','',m.group(1))
-        if len(v)==15:return v
-    m=re.search(r'(?<!\d)\d{15}(?!\d)',text)
-    if m:return m.group()
-    for line in text.splitlines():
-        for match in re.findall(r'\b[A-Z]{1,4}\d{7,15}\b',line.upper()):
-            return match
+    # Prefer numbers explicitly labeled IMEI, including split lines and spaces.
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    for i, line in enumerate(lines):
+        if re.search(r'\\bIMEI\\b', line, re.I):
+            sample = ' '.join(lines[i:i+3])
+            after = re.split(r'\\bIMEI\\b', sample, maxsplit=1, flags=re.I)[-1]
+            for match in re.findall(r'(?<!\\d)(?:\\d[\\s-]*){15}(?!\\d)', after):
+                digits = re.sub(r'\\D', '', match)
+                if len(digits) == 15:
+                    return digits
+    for match in re.findall(r'(?<!\\d)(?:\\d[\\s-]*){15}(?!\\d)', text):
+        digits = re.sub(r'\\D', '', match)
+        if len(digits) == 15:
+            return digits
+    # Do not silently substitute a serial number for an IMEI.
     return ''
+
+def normalize_photo(data):
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    image.thumbnail((2200, 2200))
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    out = io.BytesIO()
+    image.save(out, format='JPEG', quality=92)
+    return out.getvalue()
+
+def extract_on_upload(data, prefix, parser):
+    fingerprint = hashlib.sha256(data).hexdigest()
+    if st.session_state.get(prefix + '_fingerprint') == fingerprint:
+        return
+    st.session_state[prefix + '_fingerprint'] = fingerprint
+    st.session_state[prefix + '_value'] = ''
+    st.session_state[prefix + '_verified'] = False
+    st.session_state[prefix + '_ocr_raw'] = ''
+    st.session_state[prefix + '_error'] = ''
+    try:
+        with st.spinner('Reading photo automatically…'):
+            raw = ocr(data)
+            st.session_state[prefix + '_ocr_raw'] = raw
+            st.session_state[prefix + '_value'] = parser(raw)
+            if not raw.strip():
+                st.session_state[prefix + '_error'] = 'OCR detected no text. Retake a close, well-lit photo.'
+            elif not st.session_state[prefix + '_value']:
+                st.session_state[prefix + '_error'] = 'Text detected but no matching number. Review OCR text below or enter the number.'
+    except Exception as exc:
+        st.session_state[prefix + '_error'] = 'OCR service error: ' + str(exc)
 
 def upload_photo(drive, folder_id, name, content):
     metadata={'name':name,'parents':[folder_id]}
@@ -104,17 +140,13 @@ vt_source=st.radio('VT photo source',['Take photo','Upload photo'],horizontal=Tr
 vt_file=st.camera_input('Photograph VT tag',key='vtcam') if vt_source=='Take photo' else st.file_uploader('Upload VT tag photo',type=['jpg','jpeg','png'],key='vtup')
 vt_bytes=None
 if vt_file:
-    vt_bytes=vt_file.getvalue()
-    st.image(vt_bytes,caption='VT label',width=280)
-    if st.button('Read VT number from photo',use_container_width=True):
-        try:
-            with st.spinner('Reading handwritten tag…'):
-                raw=ocr(vt_bytes)
-                st.session_state['vt_value']=vt_guess(raw)
-                st.session_state['vt_ocr_raw']=raw
-                st.session_state['vt_verified']=False
-            if not st.session_state['vt_value']:st.warning('No confident VT match. Review the photo and enter the number manually.')
-        except Exception as e:st.error(f'OCR failed: {e}')
+    vt_bytes = normalize_photo(vt_file.getvalue())
+    st.image(vt_bytes, caption='VT label', width=280)
+    extract_on_upload(vt_bytes, 'vt', vt_guess)
+    if st.session_state.get('vt_error'):
+        st.warning(st.session_state['vt_error'])
+    elif st.session_state.get('vt_value'):
+        st.success('VT number extracted. Verify against the machine.')
 vt=st.text_input('Extracted VT number — correct if needed',key='vt_value')
 vt_verified=st.checkbox('I checked this VT number against the machine tag',key='vt_verified')
 
@@ -124,17 +156,13 @@ reader_source=st.radio('Reader photo source',['Take photo','Upload photo'],horiz
 reader_file=st.camera_input('Photograph reader label',key='rdcam') if reader_source=='Take photo' else st.file_uploader('Upload reader label photo',type=['jpg','jpeg','png'],key='rdup')
 reader_bytes=None
 if reader_file:
-    reader_bytes=reader_file.getvalue()
-    st.image(reader_bytes,caption='Reader label',width=280)
-    if st.button('Read reader number from photo',use_container_width=True):
-        try:
-            with st.spinner('Reading reader label…'):
-                raw=ocr(reader_bytes)
-                st.session_state['reader_value']=reader_guess(raw)
-                st.session_state['reader_ocr_raw']=raw
-                st.session_state['reader_verified']=False
-            if not st.session_state['reader_value']:st.warning('No confident reader number found. Enter the number manually.')
-        except Exception as e:st.error(f'OCR failed: {e}')
+    reader_bytes = normalize_photo(reader_file.getvalue())
+    st.image(reader_bytes, caption='Reader label', width=280)
+    extract_on_upload(reader_bytes, 'reader', reader_guess)
+    if st.session_state.get('reader_error'):
+        st.warning(st.session_state['reader_error'])
+    elif st.session_state.get('reader_value'):
+        st.success('IMEI extracted. Verify against the reader.')
 reader=st.text_input('Extracted reader number — correct if needed',key='reader_value')
 kind=st.selectbox('Reader identifier type',['IMEI (15 digits)','Serial number / other ID'])
 reader_verified=st.checkbox('I checked this number against the reader label',key='reader_verified')
@@ -155,5 +183,7 @@ if st.button('✅ Submit verified asset',type='primary',use_container_width=True
 
 with st.expander('OCR troubleshooting'):
     st.caption('If the extracted number is incorrect, correct it before verifying. Recognition is not guaranteed, particularly for handwriting.')
+    if st.session_state.get('vt_error'):st.error(st.session_state['vt_error'])
     if st.session_state.get('vt_ocr_raw'):st.code(st.session_state['vt_ocr_raw'])
+    if st.session_state.get('reader_error'):st.error(st.session_state['reader_error'])
     if st.session_state.get('reader_ocr_raw'):st.code(st.session_state['reader_ocr_raw'])
