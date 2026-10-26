@@ -1,4 +1,4 @@
-import io, re, datetime
+import io, re, datetime, hmac, hashlib
 import streamlit as st
 from PIL import Image, ImageOps
 from google.oauth2 import service_account
@@ -8,6 +8,32 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 st.set_page_config(page_title='VFS Asset Scanner', page_icon='📷', layout='centered')
+def require_login():
+    """Gate the entire app before loading any operational content."""
+    if 'auth' not in st.secrets or 'password_sha256' not in st.secrets['auth']:
+        st.error('App password is not configured. Set [auth] password_sha256 in Streamlit secrets.')
+        st.stop()
+    if st.session_state.get('authenticated'):
+        with st.sidebar:
+            if st.button('Log out'):
+                st.session_state['authenticated'] = False
+                st.rerun()
+        return
+    st.title('🔒 VFS Asset Scanner')
+    with st.form('login_form'):
+        password = st.text_input('Employee access password', type='password')
+        submitted = st.form_submit_button('Sign in', use_container_width=True)
+    if submitted:
+        entered = hashlib.sha256(password.encode('utf-8')).hexdigest()
+        expected = str(st.secrets['auth']['password_sha256']).strip().lower()
+        if hmac.compare_digest(entered, expected):
+            st.session_state['authenticated'] = True
+            st.rerun()
+        else:
+            st.error('Incorrect password.')
+    st.stop()
+
+require_login()
 st.title('📷 VFS Asset Scanner')
 st.caption('Photograph → Read → Verify → Save')
 
